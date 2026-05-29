@@ -22,22 +22,58 @@ workflows:
           cd ios
           pod install
 
-      - name: Disable Xcode code signing
+      - name: Configure Xcode signing
         script: |
-          cd ios
-          sed -i '' \
-            -e 's/CODE_SIGN_STYLE = Automatic/CODE_SIGN_STYLE = Manual/g' \
-            -e 's/CODE_SIGN_IDENTITY = "iPhone Developer"/CODE_SIGN_IDENTITY = ""/g' \
-            -e 's/CODE_SIGN_IDENTITY = "Apple Development"/CODE_SIGN_IDENTITY = ""/g' \
-            Runner.xcodeproj/project.pbxproj
-          sed -i '' '/DEVELOPMENT_TEAM/d' Runner.xcodeproj/project.pbxproj
-          echo "Code signing disabled in Xcode project"
+          python3 << 'PYEOF'
+          import re, os
+
+          proj = 'ios/Runner.xcodeproj/project.pbxproj'
+          with open(proj) as f:
+              content = f.read()
+
+          # Clear CODE_SIGN_IDENTITY (handles [sdk=iphoneos*] variants)
+          content = re.sub(r'"CODE_SIGN_IDENTITY\[sdk=iphoneos\*\]"\s*=\s*"[^"]*";',
+                           '"CODE_SIGN_IDENTITY[sdk=iphoneos*]" = "";', content)
+          content = re.sub(r'CODE_SIGN_IDENTITY\s*=\s*"[^"]*";',
+                           'CODE_SIGN_IDENTITY = "";', content)
+
+          # Switch to Manual signing
+          content = content.replace('CODE_SIGN_STYLE = Automatic;',
+                                    'CODE_SIGN_STYLE = Manual;')
+
+          # Add DEVELOPMENT_TEAM = "" if not present (Flutter requires it set)
+          if 'DEVELOPMENT_TEAM' not in content:
+              content = re.sub(r'(CODE_SIGN_STYLE = Manual;)',
+                               r'\1\n\t\t\t\tDEVELOPMENT_TEAM = "";', content)
+          else:
+              content = re.sub(r'DEVELOPMENT_TEAM\s*=\s*[^;]+;',
+                               'DEVELOPMENT_TEAM = "";', content)
+
+          with open(proj, 'w') as f:
+              f.write(content)
+
+          print('✅ Xcode project signing configured')
+          PYEOF
 
       - name: Build iOS (no code signing - for Sideloadly)
         script: |
+          # Run flutter build - ignore exit code because Flutter may fail on
+          # post-build signing validation even though xcodebuild succeeded
           flutter build ios --release \
             --dart-define=API_URL=$API_URL \
-            --no-codesign
+            --no-codesign || true
+
+          # Verify Runner.app was actually built
+          APP_PATH="build/ios/Release-iphoneos/Runner.app"
+          if [ -d "$APP_PATH" ]; then
+            echo "✅ Runner.app found at $APP_PATH"
+            ls -lah "$APP_PATH"
+          else
+            echo "❌ Runner.app not found. Checking build directory..."
+            find build/ios -name "Runner.app" 2>/dev/null || echo "No Runner.app anywhere in build/"
+            find ~/Library/Developer/Xcode/DerivedData -name "Runner.app" -path "*/Release-iphoneos/*" 2>/dev/null | head -3
+            exit 1
+          fi
 
       - name: Package IPA
         script: |
@@ -46,7 +82,7 @@ workflows:
           mkdir -p Payload
           cp -r Runner.app Payload/
           zip -r ../ipa/ElyasX-Driver.ipa Payload
-          echo "IPA created successfully"
+          echo "✅ IPA created: $(du -sh ../ipa/ElyasX-Driver.ipa)"
 
     artifacts:
       - build/ios/ipa/*.ipa
